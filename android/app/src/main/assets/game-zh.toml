@@ -1,0 +1,39 @@
+# Digimon Story: Lost Evolution — simplified-Chinese profile.
+# Produced from the retail Japanese ROM with the Xzonn DSLEChsLocalization
+# v1.0.1 patch. This file is generated/refreshed by tools/languages.py; the
+# SHA-1 below is the patched image built by this project's reproducible patch
+# pipeline (roms/... [Zh-Hans v1.0.1].nds).
+
+[game]
+name = "Digimon Story: Lost Evolution (简体中文 v1.0.1)"
+id = "BLEJ"
+region = "JPN (Zh-Hans v1.0.1 fan patch)"
+revision = 0
+status = "verified: Chinese title logo, name entry and opening dialogue render through the recomp runner"
+rom = "roms/Digimon Story - Lost Evolution (Japan) [Zh-Hans v1.0.1].nds"
+rom_size = 0x03A4F128
+sha1 = "e4798bff1c9a9753c1a32f2e3a50a3c921438f3e"
+
+[display]
+screen_layout = "single"
+supersampling = 1
+antialiasing = 0
+
+[system]
+startup_mode = "automatic"
+
+[cartridge]
+save_type = "eeprom"
+save_size = 65536
+
+[arm9]
+rom_offset = 0x00004000
+entry_pc = 0x02000800
+load_address = 0x02000000
+size = 0x0015C6B8
+
+[arm7]
+rom_offset = 0x000D9C00
+entry_pc = 0x02380000
+load_address = 0x02380000
+size = 0x00026370

@@ -1,0 +1,1604 @@
+--- a/runner/src/frontend.cpp
++++ b/runner/src/frontend.cpp
+@@ -253,6 +253,9 @@
+ #define SDL_MOUSEBUTTONDOWN SDL_EVENT_MOUSE_BUTTON_DOWN
+ #define SDL_MOUSEBUTTONUP SDL_EVENT_MOUSE_BUTTON_UP
+ #define SDL_MOUSEMOTION SDL_EVENT_MOUSE_MOTION
++#define SDL_FINGERDOWN SDL_EVENT_FINGER_DOWN
++#define SDL_FINGERMOTION SDL_EVENT_FINGER_MOTION
++#define SDL_FINGERUP SDL_EVENT_FINGER_UP
+ #define SDL_QUIT SDL_EVENT_QUIT
+ #define SDL_FALSE false
+ #define SDL_TRUE true
+@@ -269,6 +272,35 @@
+ 
+ constexpr int kScreenWidth = 256;
+ constexpr int kScreenHeight = 192;
++// Single-screen ("side panel") layout: the top screen stays at native size on
++// the left, with the touch screen as a readable 160x120 side panel. The canvas
++// is 448x192 (21:9); on a 16:9 display it letterboxes vertically instead of
++// covering the field or the dialogue box.
++constexpr int kSingleCanvasWidth = 448;
++constexpr int kSingleBottomWidth = 160;
++constexpr int kSingleBottomHeight = 120;
++constexpr int kSingleBottomY = (kScreenHeight - kSingleBottomHeight) / 2;
++constexpr int kVirtualControlsHeight = 96;
++constexpr int kSingleLandscapeHeight = kScreenHeight + kVirtualControlsHeight;
++constexpr int kSinglePortraitWidth = kScreenWidth;
++constexpr int kSinglePortraitHeight =
++    kScreenHeight * 2 + kVirtualControlsHeight;
++// Fold-aware layout uses the window aspect ratio so the hinge line maps
++// exactly onto the logical canvas. 480 matches the portrait canvas height and
++// keeps touch/panel sizes in familiar units.
++constexpr int kFoldCanvasHeight = 480;
++constexpr int kFoldCanvasMaxWidth = 1280;
++
++// Android posture state, written by nds_frontend_set_fold_state() and read by
++// the frontend loop under the serial. Permille fractions avoid depending on
++// SDL window coordinates at JNI time.
++std::atomic<uint64_t> g_fold_serial{0};
++std::atomic<int> g_fold_left_permille{0};
++std::atomic<int> g_fold_top_permille{0};
++std::atomic<int> g_fold_right_permille{0};
++std::atomic<int> g_fold_bottom_permille{0};
++std::atomic<int> g_fold_orientation{0};
++std::atomic<bool> g_fold_separating{false};
+ 
+ enum class MphPrimeInputKind : uint8_t {
+     None,
+@@ -756,9 +788,48 @@
+ }
+ 
+ bool sdl_init_frontend() {
++    // Keep the 1 ms host timer resolution used by the audio-queue throttle and
++    // the frame pacer. SDL2 got this from SDL_INIT_TIMER; SDL3 makes it a hint.
++    SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "1",
++                            SDL_HINT_OVERRIDE);
+ #if defined(NDS_HAVE_SDL3)
+-    return SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS |
+-                    SDL_INIT_GAMECONTROLLER);
++    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
++        std::fprintf(stderr, "[sdl] video/event init failed: %s\n",
++                     SDL_GetError());
++        return false;
++    }
++    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
++        // A lost audio route should not make the whole runner exit; the
++        // frontend opens a null stream and the game stays playable.
++        std::fprintf(stderr, "[sdl] audio init failed (continuing): %s\n",
++                     SDL_GetError());
++    }
++    if (!SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER)) {
++        std::fprintf(stderr,
++                     "[sdl] gamecontroller init failed (continuing): %s\n",
++                     SDL_GetError());
++    }
++    // Deterministic controller-presence test for the virtual-control
++    // auto-hide path. The Android wrapper sets this hint when a
++    // files/test-virtual-gamepad marker exists; desktop testers can set the
++    // environment variable of the same name.
++    const char* test_pad = std::getenv("NDS_TEST_VIRTUAL_GAMEPAD");
++    if (!test_pad || !*test_pad) {
++        test_pad = SDL_GetHint("NDS_TEST_VIRTUAL_GAMEPAD");
++    }
++    if (test_pad && *test_pad && test_pad[0] != '0') {
++        SDL_VirtualJoystickDesc desc;
++        SDL_INIT_INTERFACE(&desc);
++        desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
++        desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
++        desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
++        desc.name = "lostevo-test-pad";
++        const SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
++        std::fprintf(stderr, "[sdl] test virtual gamepad: %s (id=%d)\n",
++                     id != 0 ? "attached" : SDL_GetError(),
++                     static_cast<int>(id));
++    }
++    return true;
+ #else
+     return SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS |
+                     SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) == 0;
+@@ -934,21 +1005,25 @@
+ }
+ 
+ void set_touch_from_mouse(float x, float y, bool down,
+-                          NdsScreenLayout layout, int logical_width) {
+-    // Coordinates are expected in the renderer's logical DS-space.
+-    const float bottom_origin =
+-        layout == NdsScreenLayout::Separate ? 0.0f : kScreenHeight;
+-    const float left =
+-        static_cast<float>((logical_width - kScreenWidth) / 2);
+-    if (!down || x < left || x >= left + kScreenWidth ||
+-        y < bottom_origin || y >= bottom_origin + kScreenHeight) {
++                          const NdsLogicalRect& bottom_touch) {
++    // Coordinates are expected in the renderer's logical DS-space. The caller
++    // supplies the rectangle the touch screen occupies: the lower half in the
++    // stacked layout, the whole secondary window in the separate layout, and
++    // the lower-right inset in the single-screen layout.
++    if (!down || bottom_touch.width <= 0 || bottom_touch.height <= 0 ||
++        x < bottom_touch.x || x >= bottom_touch.x + bottom_touch.width ||
++        y < bottom_touch.y || y >= bottom_touch.y + bottom_touch.height) {
+         nds_set_touch(0, 0, false);
+         return;
+     }
+     const auto touch_x = static_cast<uint16_t>(std::clamp<int>(
+-        static_cast<int>(x - left), 0, kScreenWidth - 1));
++        static_cast<int>((x - bottom_touch.x) * kScreenWidth /
++                         bottom_touch.width),
++        0, kScreenWidth - 1));
+     const auto touch_y = static_cast<uint16_t>(std::clamp<int>(
+-        static_cast<int>(y - bottom_origin), 0, kScreenHeight - 1));
++        static_cast<int>((y - bottom_touch.y) * kScreenHeight /
++                         bottom_touch.height),
++        0, kScreenHeight - 1));
+     nds_set_touch(touch_x, touch_y, true);
+ }
+ 
+@@ -968,12 +1043,26 @@
+ }
+ 
+ uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
+-                     bool throttle, uint32_t pace_floor, bool& queue_error) {
++                     bool throttle, uint32_t pace_floor, bool& queue_error,
++                     uint32_t fade_total, uint32_t& fade_remaining) {
+     if (!device) return 0;
+     std::array<int16_t, 2048> samples{};
+     for (;;) {
+         const uint32_t frames = nds_spu_read_output(samples.data(), 1024);
+         if (!frames) break;
++        if (fade_total != 0 && fade_remaining != 0) {
++            const uint32_t count = std::min(frames, fade_remaining);
++            const uint32_t done = fade_total - fade_remaining;
++            for (uint32_t i = 0; i < count; ++i) {
++                const int32_t gain =
++                    static_cast<int32_t>(((done + i) * 65536u) / fade_total);
++                samples[i * 2] = static_cast<int16_t>(
++                    (static_cast<int32_t>(samples[i * 2]) * gain) >> 16);
++                samples[i * 2 + 1] = static_cast<int16_t>(
++                    (static_cast<int32_t>(samples[i * 2 + 1]) * gain) >> 16);
++            }
++            fade_remaining -= count;
++        }
+         bool pushed = false;
+         while (!pushed) {
+ #if defined(NDS_HAVE_SDL3)
+@@ -1071,6 +1160,16 @@
+     NdsAudioDevice device{};
+     device.stream = SDL_OpenAudioDeviceStream(
+         SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, nullptr, nullptr);
++    if (device.stream) {
++        SDL_AudioSpec source{};
++        SDL_AudioSpec destination{};
++        if (SDL_GetAudioStreamFormat(device.stream, &source, &destination)) {
++            std::fprintf(stderr,
++                "[sdl] audio stream: source %d Hz/%u ch -> device %d Hz/%u ch\n",
++                source.freq, source.channels, destination.freq,
++                destination.channels);
++        }
++    }
+     if (device.stream &&
+         !SDL_SetAudioStreamGetCallback(
+             device.stream, audio_stream_underrun_callback, &queue)) {
+@@ -1318,6 +1417,7 @@
+ 
+ struct FrontendPresentation {
+     bool separate = false;
++    bool single = false;
+     bool gl_top = false;
+     SDL_Window* windows[2]{};
+     SDL_Renderer* renderers[2]{};
+@@ -1326,6 +1426,21 @@
+     uint32_t window_ids[2]{};
+     int screen_widths[2]{kScreenWidth, kScreenWidth};
+     int canvas_width = kScreenWidth;
++    int canvas_height = kScreenHeight * 2;
++    bool single_portrait = false;
++    // Resolved single-screen composition in logical canvas coordinates.
++    // Fold mode replaces the fixed portrait/side-panel rectangles with a
++    // hinge-aware top/bottom (or left/right) split.
++    bool fold_split = false;
++    bool fold_horizontal = false;
++    bool fold_valid = false;
++    float fold_left = 0.0f;
++    float fold_top = 0.0f;
++    float fold_right = 0.0f;
++    float fold_bottom = 0.0f;
++    SDL_Rect layout_top{};
++    SDL_Rect layout_bottom{};
++    SDL_Rect layout_controls{};
+     int configured_sample_scale = 1;
+     int sample_scale = 1;
+ };
+@@ -1685,6 +1800,8 @@
+                          bool allow_gl_top = true) {
+     presentation.separate =
+         options.screen_layout == NdsScreenLayout::Separate;
++    presentation.single =
++        options.screen_layout == NdsScreenLayout::Single;
+ #if defined(NDS_HAVE_COMPUTE_RENDERER)
+     const char* direct_selection =
+         std::getenv("NDS_COMPUTE_DIRECT_PRESENT");
+@@ -1717,16 +1834,58 @@
+     presentation.canvas_width = std::max(
+         presentation.screen_widths[0],
+         presentation.screen_widths[1]);
++    presentation.canvas_height = kScreenHeight * 2;
++    if (presentation.single) {
++        bool portrait = false;
++        SDL_Rect display_bounds{};
++#if defined(NDS_HAVE_SDL3)
++        if (SDL_GetDisplayBounds(SDL_GetPrimaryDisplay(),
++                                 &display_bounds)) {
++            portrait = display_bounds.h > display_bounds.w;
++        }
++#else
++        if (SDL_GetDisplayBounds(0, &display_bounds) == 0) {
++            portrait = display_bounds.h > display_bounds.w;
++        }
++#endif
++        if (const char* forced = std::getenv("NDS_SINGLE_PORTRAIT")) {
++            portrait = forced[0] == '1';
++        }
++        presentation.single_portrait = portrait;
++        const bool virtual_strip =
++            options.virtual_controls != NdsVirtualControlsMode::Off;
++        if (portrait) {
++            presentation.canvas_width = std::max(
++                kSinglePortraitWidth,
++                std::max(presentation.screen_widths[0],
++                         presentation.screen_widths[1]));
++            presentation.canvas_height =
++                kScreenHeight * 2 +
++                (virtual_strip ? kVirtualControlsHeight : 0);
++        } else {
++            presentation.canvas_width = std::max(
++                kSingleCanvasWidth,
++                presentation.screen_widths[0] + 32 + kSingleBottomWidth);
++            presentation.canvas_width = std::max(
++                presentation.canvas_width, presentation.screen_widths[1]);
++            presentation.canvas_height =
++                kScreenHeight +
++                (virtual_strip ? kVirtualControlsHeight : 0);
++        }
++    }
+     const int first_height = presentation.separate
+         ? kScreenHeight * kWindowScale
+-        : kScreenHeight * 2 * kWindowScale;
++        : (presentation.single ? presentation.canvas_height
++                               : kScreenHeight * 2) * kWindowScale;
+     const uint64_t top_window_flags =
+         SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
+         (presentation.gl_top
+              ? static_cast<uint64_t>(SDL_WINDOW_OPENGL) : 0u);
+     presentation.windows[0] = create_window(
+         presentation.separate ? "ndsrecomp - Top Screen"
+-                               : "ndsrecomp firmware preview",
++                               : (presentation.single
++                                      ? "ndsrecomp - Single Screen"
++                                      : "ndsrecomp firmware preview"),
+         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+         (presentation.separate ? presentation.screen_widths[0]
+                                : presentation.canvas_width) * kWindowScale,
+@@ -1793,8 +1952,10 @@
+             continue;
+         }
+         const int logical_height =
+-            !presentation.separate && screen == 0
+-                ? kScreenHeight * 2 : kScreenHeight;
++            presentation.single
++                ? presentation.canvas_height
++                : (!presentation.separate && screen == 0
++                       ? kScreenHeight * 2 : kScreenHeight);
+         if (screen == 0 || presentation.separate) {
+             set_render_logical_size(
+                 presentation.renderers[screen],
+@@ -1868,12 +2029,237 @@
+     render_texture(renderer, source, &destination);
+ }
+ 
+-struct PresentationTicks {
+-    uint64_t upload = 0;
+-    uint64_t draw = 0;
+-    uint64_t swap = 0;
+-    bool ok = true;
++enum VirtualButtonIndex : int {
++    VB_UP = 0, VB_DOWN, VB_LEFT, VB_RIGHT,
++    VB_A, VB_B, VB_X, VB_Y,
++    VB_L, VB_R, VB_START, VB_SELECT, VB_COUNT
+ };
++
++struct VirtualButtonState {
++    bool held = false;
++    float anim = 0.0f;
++    float velocity = 0.0f;
++};
++
++struct VirtualControlsState {
++    VirtualButtonState buttons[VB_COUNT];
++    int mouse_button = -1;
++    int finger_button[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
++    int64_t finger_id[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
++    bool visible = false;
++};
++
++struct VirtualButtonRect {
++    float x = 0.0f;
++    float y = 0.0f;
++    float radius = 0.0f;
++};
++
++constexpr uint16_t kVirtualBits[VB_COUNT] = {
++    1u << 6, 1u << 7, 1u << 5, 1u << 4,
++    1u << 0, 1u << 1, 1u << 10, 1u << 11,
++    1u << 8, 1u << 9, 1u << 3, 1u << 2,
++};
++
++const char* virtual_button_label(int index) {
++    static const char* labels[VB_COUNT] = {
++        "U", "D", "L", "R", "A", "B", "X", "Y", "L", "R", "ST", "SE",
++    };
++    return index >= 0 && index < VB_COUNT ? labels[index] : "?";
++}
++
++void virtual_control_rects(const struct FrontendPresentation& presentation,
++                           VirtualButtonRect out[VB_COUNT]) {
++    const bool portrait = presentation.single_portrait;
++    const float game_h = portrait ? kScreenHeight * 2.0f
++                                  : static_cast<float>(kScreenHeight);
++    const float strip_y = game_h;
++    if (presentation.fold_split) {
++        const SDL_Rect& panel = presentation.layout_controls;
++        const float panel_w = static_cast<float>(std::max(1, panel.w));
++        const float panel_h = static_cast<float>(std::max(1, panel.h));
++        const float radius = std::clamp(
++            std::min(panel_w, panel_h) * 0.075f, 10.0f, 20.0f);
++        const float offset = radius * 1.7f;
++        const float dpad_x = panel.x + panel_w * 0.25f;
++        const float face_x = panel.x + panel_w * 0.75f;
++        const float center_y = panel.y + panel_h * 0.48f;
++        out[VB_UP] = {dpad_x, center_y - offset, radius};
++        out[VB_DOWN] = {dpad_x, center_y + offset, radius};
++        out[VB_LEFT] = {dpad_x - offset, center_y, radius};
++        out[VB_RIGHT] = {dpad_x + offset, center_y, radius};
++        out[VB_Y] = {face_x, center_y - offset, radius};
++        out[VB_X] = {face_x - offset, center_y, radius};
++        out[VB_B] = {face_x, center_y + offset, radius};
++        out[VB_A] = {face_x + offset, center_y, radius};
++        out[VB_L] = {panel.x + radius + 4.0f,
++                     panel.y + radius + 4.0f, radius * 0.85f};
++        out[VB_R] = {panel.x + panel_w - radius - 4.0f,
++                     panel.y + radius + 4.0f, radius * 0.85f};
++        out[VB_START] = {panel.x + panel_w * 0.5f - radius * 1.8f,
++                         panel.y + panel_h - radius * 1.4f,
++                         radius * 0.9f};
++        out[VB_SELECT] = {panel.x + panel_w * 0.5f + radius * 1.8f,
++                          panel.y + panel_h - radius * 1.4f,
++                          radius * 0.9f};
++        return;
++    }
++    if (portrait) {
++        const float dpad_x = 56.0f;
++        const float dpad_y = strip_y + 48.0f;
++        out[VB_UP] = {dpad_x, dpad_y - 28.0f, 18.0f};
++        out[VB_DOWN] = {dpad_x, dpad_y + 28.0f, 18.0f};
++        out[VB_LEFT] = {dpad_x - 28.0f, dpad_y, 18.0f};
++        out[VB_RIGHT] = {dpad_x + 28.0f, dpad_y, 18.0f};
++        const float face_x = presentation.canvas_width - 56.0f;
++        const float face_y = dpad_y;
++        out[VB_Y] = {face_x, face_y - 34.0f, 18.0f};
++        out[VB_X] = {face_x - 34.0f, face_y, 18.0f};
++        out[VB_B] = {face_x, face_y + 34.0f, 18.0f};
++        out[VB_A] = {face_x + 34.0f, face_y, 18.0f};
++        out[VB_L] = {20.0f, strip_y + 18.0f, 15.0f};
++        out[VB_R] = {presentation.canvas_width - 20.0f,
++                     strip_y + 18.0f, 15.0f};
++        out[VB_START] = {presentation.canvas_width * 0.5f - 28.0f,
++                         strip_y + 76.0f, 14.0f};
++        out[VB_SELECT] = {presentation.canvas_width * 0.5f + 28.0f,
++                          strip_y + 76.0f, 14.0f};
++    } else {
++        const float dpad_x = 56.0f;
++        const float dpad_y = strip_y + 46.0f;
++        out[VB_UP] = {dpad_x, dpad_y - 24.0f, 15.0f};
++        out[VB_DOWN] = {dpad_x, dpad_y + 24.0f, 15.0f};
++        out[VB_LEFT] = {dpad_x - 24.0f, dpad_y, 15.0f};
++        out[VB_RIGHT] = {dpad_x + 24.0f, dpad_y, 15.0f};
++        const float face_x = presentation.canvas_width - 64.0f;
++        const float face_y = dpad_y;
++        out[VB_Y] = {face_x, face_y - 30.0f, 16.0f};
++        out[VB_X] = {face_x - 30.0f, face_y, 16.0f};
++        out[VB_B] = {face_x, face_y + 30.0f, 16.0f};
++        out[VB_A] = {face_x + 30.0f, face_y, 16.0f};
++        out[VB_L] = {18.0f, strip_y + 16.0f, 13.0f};
++        out[VB_R] = {presentation.canvas_width - 18.0f,
++                     strip_y + 16.0f, 13.0f};
++        out[VB_START] = {presentation.canvas_width * 0.5f - 26.0f,
++                         strip_y + 34.0f, 13.0f};
++        out[VB_SELECT] = {presentation.canvas_width * 0.5f + 26.0f,
++                          strip_y + 34.0f, 13.0f};
++    }
++}
++
++int virtual_control_at(const struct FrontendPresentation& presentation,
++                       float x, float y) {
++    VirtualButtonRect rects[VB_COUNT];
++    virtual_control_rects(presentation, rects);
++    for (int i = 0; i < VB_COUNT; ++i) {
++        const float dx = x - rects[i].x;
++        const float dy = y - rects[i].y;
++        const float radius = rects[i].radius + 6.0f;
++        if (dx * dx + dy * dy <= radius * radius) return i;
++    }
++    return -1;
++}
++
++uint16_t virtual_controls_mask(const VirtualControlsState& state) {
++    uint16_t mask = 0;
++    for (int i = 0; i < VB_COUNT; ++i) {
++        if (state.buttons[i].held) mask |= kVirtualBits[i];
++    }
++    return mask;
++}
++
++void fill_circle(SDL_Renderer* renderer, float cx, float cy, float radius,
++                 Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
++    SDL_SetRenderDrawColor(renderer, r, g, b, a);
++    const int top = static_cast<int>(std::floor(cy - radius));
++    const int bottom = static_cast<int>(std::ceil(cy + radius));
++    for (int y = top; y <= bottom; ++y) {
++        const float dy = static_cast<float>(y) + 0.5f - cy;
++        if (std::fabs(dy) > radius) continue;
++        const float half = std::sqrt(std::max(0.0f, radius * radius - dy * dy));
++        SDL_FRect line{std::floor(cx - half), static_cast<float>(y),
++                       std::ceil(half * 2.0f), 1.0f};
++        SDL_RenderFillRect(renderer, &line);
++    }
++}
++
++void draw_virtual_label(SDL_Renderer* renderer, const char* text,
++                        float cx, float cy, float scale) {
++    const int text_len = static_cast<int>(std::strlen(text));
++    const float char_w = 5.0f * scale + scale;
++    float x = cx - (text_len * char_w - scale) * 0.5f;
++    SDL_SetRenderDrawColor(renderer, 245, 248, 255, 255);
++    for (const char* p = text; *p; ++p) {
++        const char* glyph = notice_glyph(*p);
++        for (int gy = 0; gy < 7; ++gy) {
++            for (int gx = 0; gx < 5; ++gx) {
++                if (glyph[gy * 5 + gx] != '1') continue;
++                SDL_FRect pixel{x + gx * scale,
++                                cy - 3.5f * scale + gy * scale,
++                                scale, scale};
++                SDL_RenderFillRect(renderer, &pixel);
++            }
++        }
++        x += char_w;
++    }
++}
++
++void draw_virtual_controls(SDL_Renderer* renderer,
++                           const struct FrontendPresentation& presentation,
++                           VirtualControlsState& state) {
++    if (!presentation.single || !state.visible) return;
++    VirtualButtonRect rects[VB_COUNT];
++    virtual_control_rects(presentation, rects);
++    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
++    SDL_SetRenderDrawColor(renderer, 8, 12, 20, 150);
++    SDL_FRect strip{};
++    if (presentation.fold_split) {
++        strip = SDL_FRect{
++            static_cast<float>(presentation.layout_controls.x),
++            static_cast<float>(presentation.layout_controls.y),
++            static_cast<float>(presentation.layout_controls.w),
++            static_cast<float>(presentation.layout_controls.h)};
++    } else {
++        const float game_h = presentation.single_portrait
++            ? kScreenHeight * 2.0f
++            : static_cast<float>(kScreenHeight);
++        strip = SDL_FRect{
++            0.0f, game_h, static_cast<float>(presentation.canvas_width),
++            static_cast<float>(presentation.canvas_height) - game_h};
++    }
++    SDL_RenderFillRect(renderer, &strip);
++    for (int i = 0; i < VB_COUNT; ++i) {
++        VirtualButtonState& button = state.buttons[i];
++        const float target = button.held ? 1.0f : 0.0f;
++        button.velocity += (target - button.anim) * 0.38f;
++        button.velocity *= 0.70f;
++        button.anim += button.velocity;
++        button.anim = std::clamp(button.anim, 0.0f, 1.0f);
++        const float radius = rects[i].radius * (1.0f + 0.14f * button.anim);
++        if (button.anim > 0.01f) {
++            fill_circle(renderer, rects[i].x, rects[i].y, radius + 5.0f,
++                        90, 210, 255,
++                        static_cast<Uint8>(40.0f + 70.0f * button.anim));
++        }
++        fill_circle(renderer, rects[i].x, rects[i].y, radius,
++                    22, 28, 40, 225);
++        fill_circle(renderer, rects[i].x, rects[i].y, radius - 2.0f,
++                    44, 56, 76, button.held ? 235 : 190);
++        SDL_SetRenderDrawColor(renderer, 130, 215, 255,
++                               button.held ? 255 : 170);
++        // Outline ring, drawn as a thin circle.
++        for (int step = 0; step < 48; ++step) {
++            const float angle = static_cast<float>(step) * 6.2831853f / 48.0f;
++            const float x = rects[i].x + std::cos(angle) * radius;
++            const float y = rects[i].y + std::sin(angle) * radius;
++            SDL_FRect px{x, y, 1.5f, 1.5f};
++            SDL_RenderFillRect(renderer, &px);
++        }
++        draw_virtual_label(renderer, virtual_button_label(i),
++                           rects[i].x, rects[i].y,
++                           radius >= 17.0f ? 2.0f : 1.6f);
++    }
++}
+ 
+ // All-or-nothing. The only fallible step is the renderer rebuild, so it runs
+ // FIRST and nothing else is touched until it has succeeded: a failed apply
+@@ -1913,6 +2299,98 @@
+     render_line(renderer, x, y + 2, x, y + 5);
+ }
+ 
++bool frontend_shot_frame(uint64_t frame) {
++    static const std::string spec = [] {
++        const char* value = std::getenv("NDS_FRONTEND_SHOT_AT");
++        return value ? std::string(value) : std::string();
++    }();
++    if (spec.empty() || frame == 0) return false;
++    const char* cursor = spec.c_str();
++    while (*cursor) {
++        char* end = nullptr;
++        const unsigned long long value = std::strtoull(cursor, &end, 0);
++        if (end == cursor) break;
++        if (value == frame) return true;
++        cursor = end;
++        while (*cursor == ',' || *cursor == ' ' || *cursor == '\t') ++cursor;
++    }
++    return false;
++}
++
++void save_frontend_shot(SDL_Renderer* renderer, uint64_t frame,
++                        const char* suffix = "") {
++    if (!renderer || !frontend_shot_frame(frame)) return;
++    const char* directory = std::getenv("NDS_FRONTEND_SHOT_DIR");
++    if (!directory || !*directory) return;
++    std::error_code error;
++    std::filesystem::create_directories(directory, error);
++#if defined(NDS_HAVE_SDL3)
++    SDL_Surface* surface = SDL_RenderReadPixels(renderer, nullptr);
++    if (!surface) return;
++    char name[64];
++    std::snprintf(name, sizeof(name), "frame-%06llu%s.bmp",
++                  static_cast<unsigned long long>(frame), suffix);
++    const std::filesystem::path path =
++        std::filesystem::path(directory) / name;
++    SDL_SaveBMP(surface, path.string().c_str());
++    SDL_DestroySurface(surface);
++#else
++    int width = 0;
++    int height = 0;
++    if (SDL_GetRendererOutputSize(renderer, &width, &height) != 0 ||
++        width <= 0 || height <= 0) {
++        return;
++    }
++    SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(
++        0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
++    if (!surface) return;
++    if (SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888,
++                             surface->pixels, surface->pitch) == 0) {
++        char name[64];
++        std::snprintf(name, sizeof(name), "frame-%06llu%s.bmp",
++                      static_cast<unsigned long long>(frame), suffix);
++        const std::filesystem::path path =
++            std::filesystem::path(directory) / name;
++        SDL_SaveBMP(surface, path.string().c_str());
++    }
++    SDL_FreeSurface(surface);
++#endif
++}
++
++uint16_t scripted_key_mask(uint64_t frame) {
++    // Deterministic host input for layout/audit runs:
++    //   NDS_FRONTEND_INPUT="1201:8,1211:0,1501:8,1511:0"
++    // Each entry is frame:active-high-pressed-mask (bit 0=A ... bit 11=Y).
++    static const std::string spec = [] {
++        const char* value = std::getenv("NDS_FRONTEND_INPUT");
++        return value ? std::string(value) : std::string();
++    }();
++    if (spec.empty() || frame == 0) return 0;
++    const char* cursor = spec.c_str();
++    uint16_t mask = 0;
++    while (*cursor) {
++        char* end = nullptr;
++        const unsigned long long at = std::strtoull(cursor, &end, 0);
++        if (end == cursor) break;
++        cursor = end;
++        while (*cursor == ':' || *cursor == ' ' || *cursor == '\t') ++cursor;
++        char* mask_end = nullptr;
++        const unsigned long long value = std::strtoull(cursor, &mask_end, 0);
++        if (mask_end == cursor) break;
++        cursor = mask_end;
++        if (at == frame) mask = static_cast<uint16_t>(value & 0x0FFFu);
++        while (*cursor == ',' || *cursor == ' ' || *cursor == '\t') ++cursor;
++    }
++    return mask;
++}
++
++struct PresentationTicks {
++    uint64_t upload = 0;
++    uint64_t draw = 0;
++    uint64_t swap = 0;
++    bool ok = true;
++};
++
+ PresentationTicks present_screens(FrontendPresentation& presentation,
+                                   const uint32_t* top_pixels,
+                                   int top_width,
+@@ -1922,7 +2400,9 @@
+                                   bool virtual_stylus_visible,
+                                   float virtual_stylus_x,
+                                   float virtual_stylus_y,
+-                                  const char* savestate_notice) {
++                                  const char* savestate_notice,
++                                  VirtualControlsState& virtual_controls,
++                                  uint64_t frame_number) {
+     PresentationTicks ticks{};
+     if (presentation.gl_top) {
+ #if defined(NDS_HAVE_COMPUTE_RENDERER)
+@@ -1958,6 +2438,7 @@
+         draw_savestate_notice(renderer, screen_rect, savestate_notice);
+         ticks.draw += SDL_GetPerformanceCounter() - start;
+         start = SDL_GetPerformanceCounter();
++        save_frontend_shot(renderer, frame_number);
+         SDL_RenderPresent(renderer);
+         ticks.swap += SDL_GetPerformanceCounter() - start;
+ #endif
+@@ -1976,22 +2457,43 @@
+         start = SDL_GetPerformanceCounter();
+         SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+         SDL_RenderClear(renderer);
+-        const SDL_Rect top_rect{
+-            (presentation.canvas_width -
+-             presentation.screen_widths[0]) / 2,
+-            0, presentation.screen_widths[0], kScreenHeight};
+-        const SDL_Rect bottom_rect{
+-            (presentation.canvas_width -
+-             presentation.screen_widths[1]) / 2,
+-            kScreenHeight, presentation.screen_widths[1], kScreenHeight};
++        const SDL_Rect top_rect = presentation.single
++            ? presentation.layout_top
++            : SDL_Rect{(presentation.canvas_width -
++                            presentation.screen_widths[0]) / 2,
++                       0, presentation.screen_widths[0], kScreenHeight};
++        const SDL_Rect bottom_rect = presentation.single
++            ? presentation.layout_bottom
++            : SDL_Rect{(presentation.canvas_width -
++                            presentation.screen_widths[1]) / 2,
++                       kScreenHeight, presentation.screen_widths[1],
++                       kScreenHeight};
+         render_screen(presentation, 0, top_rect);
+         render_screen(presentation, 1, bottom_rect);
++        draw_virtual_controls(renderer, presentation, virtual_controls);
++        if (presentation.single) {
++            // A quiet frame makes the touch inset readable over bright fields.
++            SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255);
++#if defined(NDS_HAVE_SDL3)
++            const SDL_FRect border_f{
++                static_cast<float>(bottom_rect.x - 1),
++                static_cast<float>(bottom_rect.y - 1),
++                static_cast<float>(bottom_rect.w + 2),
++                static_cast<float>(bottom_rect.h + 2)};
++            SDL_RenderRect(renderer, &border_f);
++#else
++            const SDL_Rect border{bottom_rect.x - 1, bottom_rect.y - 1,
++                                  bottom_rect.w + 2, bottom_rect.h + 2};
++            SDL_RenderDrawRect(renderer, &border);
++#endif
++        }
+         if (virtual_stylus_visible)
+             draw_virtual_stylus(renderer, bottom_rect,
+                                 virtual_stylus_x, virtual_stylus_y);
+         draw_savestate_notice(renderer, bottom_rect, savestate_notice);
+         ticks.draw += SDL_GetPerformanceCounter() - start;
+         start = SDL_GetPerformanceCounter();
++        save_frontend_shot(renderer, frame_number);
+         SDL_RenderPresent(renderer);
+         ticks.swap += SDL_GetPerformanceCounter() - start;
+         return ticks;
+@@ -2012,6 +2514,8 @@
+             draw_savestate_notice(renderer, screen_rect, savestate_notice);
+         ticks.draw += SDL_GetPerformanceCounter() - start;
+         start = SDL_GetPerformanceCounter();
++        save_frontend_shot(renderer, frame_number,
++                           screen == 0 ? "-top" : "-bottom");
+         SDL_RenderPresent(renderer);
+         ticks.swap += SDL_GetPerformanceCounter() - start;
+     }
+@@ -2020,8 +2524,64 @@
+ 
+ } // namespace
+ 
++void nds_frontend_set_fold_state(int left, int top, int right, int bottom,
++                                 int orientation, bool separating,
++                                 int window_width, int window_height) {
++    int left_permille = 0;
++    int top_permille = 0;
++    int right_permille = 0;
++    int bottom_permille = 0;
++    if (separating && window_width > 0 && window_height > 0) {
++        auto permille = [](int value, int extent) {
++            const long long scaled =
++                static_cast<long long>(value) * 1000 / extent;
++            return static_cast<int>(std::clamp<long long>(scaled, 0, 1000));
++        };
++        left_permille = permille(left, window_width);
++        top_permille = permille(top, window_height);
++        right_permille = permille(right, window_width);
++        bottom_permille = permille(bottom, window_height);
++        if (right_permille <= left_permille ||
++            bottom_permille <= top_permille) {
++            separating = false;
++        }
++    }
++    if (!separating) {
++        left_permille = top_permille = right_permille = bottom_permille = 0;
++        orientation = 0;
++    }
++    g_fold_left_permille.store(left_permille, std::memory_order_relaxed);
++    g_fold_top_permille.store(top_permille, std::memory_order_relaxed);
++    g_fold_right_permille.store(right_permille, std::memory_order_relaxed);
++    g_fold_bottom_permille.store(bottom_permille, std::memory_order_relaxed);
++    g_fold_orientation.store(orientation, std::memory_order_relaxed);
++    g_fold_separating.store(separating, std::memory_order_relaxed);
++    g_fold_serial.fetch_add(1, std::memory_order_release);
++}
++
+ int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
+     NdsFrontendOptions options = initial_options;
++    auto audio_env_u32 = [](const char* name, uint32_t fallback,
++                            uint32_t minimum, uint32_t maximum) {
++        const char* value = std::getenv(name);
++        if (!value || !*value) return fallback;
++        char* end = nullptr;
++        const unsigned long parsed = std::strtoul(value, &end, 0);
++        if (end == value) return fallback;
++        return static_cast<uint32_t>(
++            std::clamp<unsigned long>(parsed, minimum, maximum));
++    };
++    // Optional low-latency audio tuning. Defaults preserve the validated
++    // 2,048-frame (~63 ms) steady-state buffer and the 57,344-frame boot
++    // prebuffer; a title can lower the startup latency without changing the
++    // scheduler or the emulated SPU.
++    const uint32_t audio_queue_frames =
++        audio_env_u32("NDS_AUDIO_QUEUE_FRAMES", kAudioQueueFrames, 512, 8192);
++    const uint32_t audio_start_frames =
++        audio_env_u32("NDS_AUDIO_START_FRAMES", kAudioStartFrames,
++                      audio_queue_frames, kAudioCapacityFrames);
++    const uint32_t audio_fade_frames =
++        audio_env_u32("NDS_AUDIO_FADE_FRAMES", 0, 0, 4096);
+     SDL_SetMainReady();
+     // SDL_INIT_TIMER matters on Windows: it raises the OS timer resolution
+     // to 1 ms (SDL_HINT_TIMER_RESOLUTION default). Without it SDL_Delay(1)
+@@ -2053,12 +2613,228 @@
+         : presentation.canvas_width;
+     const int bottom_content_left =
+         (bottom_logical_width - kScreenWidth) / 2;
+-    const int top_content_left = presentation.separate
+-        ? 0 : (presentation.canvas_width - presentation.screen_widths[0]) / 2;
+-    const NdsLogicalRect stacked_top_screen{
+-        top_content_left, 0, presentation.screen_widths[0], kScreenHeight};
+-    const NdsLogicalRect stacked_bottom_touch{
+-        bottom_content_left, kScreenHeight, kScreenWidth, kScreenHeight};
++    NdsLogicalRect stacked_top_screen{
++        presentation.separate
++            ? 0
++            : (presentation.canvas_width -
++               presentation.screen_widths[0]) / 2,
++        0, presentation.screen_widths[0], kScreenHeight};
++    NdsLogicalRect stacked_bottom_touch{
++        bottom_content_left,
++        presentation.separate ? 0 : kScreenHeight,
++        kScreenWidth, kScreenHeight};
++    auto reconfigure_single = [&]() {
++        if (!presentation.single) return;
++        int window_width = 0;
++        int window_height = 0;
++        SDL_GetWindowSize(presentation.windows[0], &window_width,
++                          &window_height);
++        if (window_width <= 0 || window_height <= 0) return;
++        bool portrait = window_height > window_width;
++        if (const char* forced = std::getenv("NDS_SINGLE_PORTRAIT")) {
++            portrait = forced[0] == '1';
++        }
++        const bool virtual_strip =
++            options.virtual_controls != NdsVirtualControlsMode::Off;
++        int canvas_width = 0;
++        int canvas_height = 0;
++        SDL_Rect top{};
++        SDL_Rect bottom{};
++        SDL_Rect controls{};
++        bool fold_split = false;
++        bool fold_horizontal = false;
++        constexpr int margin = 8;
++        if (presentation.fold_valid) {
++            const float left = std::clamp(
++                presentation.fold_left * 0.001f, 0.0f, 1.0f);
++            const float top_frac = std::clamp(
++                presentation.fold_top * 0.001f, 0.0f, 1.0f);
++            const float right = std::clamp(
++                presentation.fold_right * 0.001f, 0.0f, 1.0f);
++            const float bottom_frac = std::clamp(
++                presentation.fold_bottom * 0.001f, 0.0f, 1.0f);
++            if (presentation.fold_horizontal) {
++                canvas_height = kFoldCanvasHeight;
++                canvas_width = std::clamp(
++                    static_cast<int>(std::lround(
++                        static_cast<double>(kFoldCanvasHeight) *
++                        window_width / window_height)),
++                    kSingleCanvasWidth, kFoldCanvasMaxWidth);
++                const int hinge_top = std::clamp(
++                    static_cast<int>(std::lround(top_frac * canvas_height)),
++                    0, canvas_height);
++                const int hinge_bottom = std::clamp(
++                    static_cast<int>(
++                        std::lround(bottom_frac * canvas_height)),
++                    hinge_top, canvas_height);
++                const int lower_height = canvas_height - hinge_bottom;
++                if (hinge_top > margin * 2 && lower_height > margin * 2) {
++                    const float top_scale = std::min(
++                        (canvas_width - margin * 2) /
++                            static_cast<float>(presentation.screen_widths[0]),
++                        (hinge_top - margin * 2) /
++                            static_cast<float>(kScreenHeight));
++                    const int controls_width = std::clamp(
++                        static_cast<int>(
++                            std::lround(canvas_width * 0.32f)),
++                        220, 360);
++                    const int available_width =
++                        canvas_width - controls_width - margin * 2;
++                    const float bottom_scale = std::min(
++                        available_width /
++                            static_cast<float>(presentation.screen_widths[1]),
++                        (lower_height - margin * 2) /
++                            static_cast<float>(kScreenHeight));
++                    if (top_scale >= 0.25f && bottom_scale >= 0.25f) {
++                        const int top_w = std::max(
++                            1, static_cast<int>(std::lround(
++                                   presentation.screen_widths[0] *
++                                   top_scale)));
++                        const int top_h = std::max(
++                            1, static_cast<int>(std::lround(
++                                   kScreenHeight * top_scale)));
++                        const int bottom_w = std::max(
++                            1, static_cast<int>(std::lround(
++                                   presentation.screen_widths[1] *
++                                   bottom_scale)));
++                        const int bottom_h = std::max(
++                            1, static_cast<int>(std::lround(
++                                   kScreenHeight * bottom_scale)));
++                        top = SDL_Rect{(canvas_width - top_w) / 2,
++                                       (hinge_top - top_h) / 2,
++                                       top_w, top_h};
++                        bottom = SDL_Rect{
++                            margin + (available_width - bottom_w) / 2,
++                            hinge_bottom + (lower_height - bottom_h) / 2,
++                            bottom_w, bottom_h};
++                        controls = SDL_Rect{canvas_width - controls_width,
++                                            hinge_bottom, controls_width,
++                                            lower_height};
++                        fold_split = true;
++                        fold_horizontal = true;
++                    }
++                }
++            } else {
++                canvas_width = kFoldCanvasHeight;
++                canvas_height = std::clamp(
++                    static_cast<int>(std::lround(
++                        static_cast<double>(kFoldCanvasHeight) *
++                        window_height / window_width)),
++                    kSingleCanvasWidth, kFoldCanvasMaxWidth);
++                const int hinge_left = std::clamp(
++                    static_cast<int>(std::lround(left * canvas_width)),
++                    0, canvas_width);
++                const int hinge_right = std::clamp(
++                    static_cast<int>(std::lround(right * canvas_width)),
++                    hinge_left, canvas_width);
++                const int right_width = canvas_width - hinge_right;
++                if (hinge_left > margin * 2 && right_width > margin * 2) {
++                    const float top_scale = std::min(
++                        (hinge_left - margin * 2) /
++                            static_cast<float>(presentation.screen_widths[0]),
++                        (canvas_height - margin * 2) /
++                            static_cast<float>(kScreenHeight));
++                    const int controls_height = std::clamp(
++                        static_cast<int>(
++                            std::lround(canvas_height * 0.30f)),
++                        180, 360);
++                    const int available_height =
++                        canvas_height - controls_height - margin * 2;
++                    const float bottom_scale = std::min(
++                        (right_width - margin * 2) /
++                            static_cast<float>(presentation.screen_widths[1]),
++                        available_height /
++                            static_cast<float>(kScreenHeight));
++                    if (top_scale >= 0.25f && bottom_scale >= 0.25f) {
++                        const int top_w = std::max(
++                            1, static_cast<int>(std::lround(
++                                   presentation.screen_widths[0] *
++                                   top_scale)));
++                        const int top_h = std::max(
++                            1, static_cast<int>(std::lround(
++                                   kScreenHeight * top_scale)));
++                        const int bottom_w = std::max(
++                            1, static_cast<int>(std::lround(
++                                   presentation.screen_widths[1] *
++                                   bottom_scale)));
++                        const int bottom_h = std::max(
++                            1, static_cast<int>(std::lround(
++                                   kScreenHeight * bottom_scale)));
++                        top = SDL_Rect{(hinge_left - top_w) / 2,
++                                       (canvas_height - top_h) / 2,
++                                       top_w, top_h};
++                        bottom = SDL_Rect{
++                            hinge_right + (right_width - bottom_w) / 2,
++                            margin + (available_height - bottom_h) / 2,
++                            bottom_w, bottom_h};
++                        controls = SDL_Rect{hinge_right,
++                                            canvas_height - controls_height,
++                                            right_width, controls_height};
++                        fold_split = true;
++                        fold_horizontal = false;
++                    }
++                }
++            }
++        }
++        if (!fold_split) {
++            if (portrait) {
++                canvas_width = std::max(
++                    kSinglePortraitWidth,
++                    std::max(presentation.screen_widths[0],
++                             presentation.screen_widths[1]));
++                canvas_height = kScreenHeight * 2 +
++                    (virtual_strip ? kVirtualControlsHeight : 0);
++                top = SDL_Rect{
++                    (canvas_width - presentation.screen_widths[0]) / 2, 0,
++                    presentation.screen_widths[0], kScreenHeight};
++                bottom = SDL_Rect{
++                    (canvas_width - presentation.screen_widths[1]) / 2,
++                    kScreenHeight, presentation.screen_widths[1],
++                    kScreenHeight};
++                controls = SDL_Rect{
++                    0, kScreenHeight * 2, canvas_width,
++                    virtual_strip ? kVirtualControlsHeight : 0};
++            } else {
++                canvas_width = std::max(
++                    kSingleCanvasWidth,
++                    presentation.screen_widths[0] + 32 +
++                        kSingleBottomWidth);
++                canvas_width = std::max(
++                    canvas_width, presentation.screen_widths[1]);
++                canvas_height = kScreenHeight +
++                    (virtual_strip ? kVirtualControlsHeight : 0);
++                top = SDL_Rect{0, 0, presentation.screen_widths[0],
++                               kScreenHeight};
++                bottom = SDL_Rect{canvas_width - kSingleBottomWidth,
++                                  kSingleBottomY, kSingleBottomWidth,
++                                  kSingleBottomHeight};
++                controls = SDL_Rect{0, kScreenHeight, canvas_width,
++                                    virtual_strip
++                                        ? kVirtualControlsHeight : 0};
++            }
++        }
++        presentation.single_portrait = fold_split ? false : portrait;
++        presentation.fold_split = fold_split;
++        presentation.fold_horizontal = fold_horizontal;
++        presentation.canvas_width = canvas_width;
++        presentation.canvas_height = canvas_height;
++        presentation.layout_top = top;
++        presentation.layout_bottom = bottom;
++        presentation.layout_controls = controls;
++        set_render_logical_size(presentation.renderers[0], canvas_width,
++                                canvas_height);
++        stacked_top_screen =
++            NdsLogicalRect{top.x, top.y, top.w, top.h};
++        stacked_bottom_touch =
++            NdsLogicalRect{bottom.x, bottom.y, bottom.w, bottom.h};
++    };
++    reconfigure_single();
++    const int top_content_left = presentation.single
++        ? presentation.layout_top.x
++        : (presentation.separate
++               ? 0
++               : (presentation.canvas_width -
++                  presentation.screen_widths[0]) / 2);
+     std::fprintf(stderr,
+         "[sdl] layout=%s fullscreen=%s adaptive=%s supersampling=%ux aa=%ux "
+         "internal=%ux\n",
+@@ -2173,7 +2949,7 @@
+     // still holds a comfortable runway (half the steady-state target, ~31 ms).
+     // At or below that the loop is not keeping up and the synthetic present is
+     // skipped for that frame. Nothing in this path ever sleeps or busy-loops.
+-    constexpr uint32_t kInterpolationAudioFloorFrames = kAudioQueueFrames / 2;
++    const uint32_t kInterpolationAudioFloorFrames = audio_queue_frames / 2;
+     int interpolation_min_refresh_hz = kInterpolationMinRefreshHz;
+     if (const uint64_t forced_min_refresh =
+             environment_u64("NDS_FRAME_INTERPOLATION_MIN_REFRESH")) {
+@@ -2214,6 +2990,7 @@
+     }
+ 
+     AudioQueue audio_queue{};
++    VirtualControlsState virtual_controls{};
+     SDL_AudioSpec want{};
+     // The mixer runs once per 1024 DS system cycles. Request its integer host
+     // rate directly; the sub-sample remainder is absorbed by the bounded queue
+@@ -2320,6 +3097,8 @@
+     uint16_t controller_pressed = 0;
+     uint16_t mouse_pressed = 0;
+     uint16_t mph_prime_pressed = 0;
++    uint16_t scripted_pressed = 0;
++    uint16_t virtual_controls_pressed = 0;
+     // Left analog stick mapped to the D-pad (movement in MPH, menus
+     // everywhere), kept separate from button-event state so a wobbling
+     // stick never fights explicit D-pad presses.
+@@ -2328,7 +3107,8 @@
+         nds_set_key_mask(static_cast<uint16_t>(
+             0x0FFFu &
+             ~(keyboard_pressed | controller_pressed | mouse_pressed |
+-              mph_prime_pressed | stick_pressed)));
++              mph_prime_pressed | stick_pressed | scripted_pressed |
++              virtual_controls_pressed)));
+     };
+     publish_keys();
+     nds_set_touch(0, 0, false);
+@@ -2653,6 +3433,7 @@
+         std::fprintf(stderr, "[sdl] relative mouse captured\n");
+     };
+     uint64_t shown_frames = 0;
++    uint64_t last_fold_serial = 0;
+     uint64_t synthetic_presents = 0;
+     FrameBlendCache blend_cache{};
+     uint64_t fps_frames = 0;
+@@ -2669,7 +3450,8 @@
+     const uint64_t relative_mouse_selftest_start_vblank =
+         environment_u64("NDS_FRONTEND_SELFTEST_RELATIVE_MOUSE_VBLANK");
+     bool audio_started = false;
+-    uint32_t audio_start_threshold = kAudioStartFrames;
++    uint32_t audio_start_threshold = audio_start_frames;
++    uint32_t audio_fade_remaining = 0;
+     bool audio_queue_error = false;
+     uint64_t audio_presentation_epoch = nds_spu_presentation_epoch();
+     bool turbo_pressed = false;
+@@ -2718,7 +3500,7 @@
+         if (!was_open && runtime_menu_open())
+             clear_gameplay_input_for_runtime_menu();
+     };
+-    uint32_t audio_pace_floor = kAudioQueueFrames;
++    uint32_t audio_pace_floor = audio_queue_frames;
+     uint32_t audio_min_queue = std::numeric_limits<uint32_t>::max();
+     uint32_t audio_max_queue = 0;
+     uint64_t host_key_presses = 0;
+@@ -2781,7 +3563,8 @@
+         g_input_debug.published_key_mask = static_cast<uint16_t>(
+             0x0FFFu & ~(keyboard_pressed | controller_pressed |
+                         mouse_pressed | mph_prime_pressed |
+-                        stick_pressed));
++                        stick_pressed | scripted_pressed |
++                        virtual_controls_pressed));
+         g_input_debug.relative_direct_writes = relative_direct_writes;
+         g_input_debug.mph_prime_key_downs = mph_prime_key_downs;
+         g_input_debug.mph_prime_mouse_downs = mph_prime_mouse_downs;
+@@ -2820,6 +3603,38 @@
+         // client is connected). See debug_server.h.
+         publish_input_debug();
+         debug_pump();
++        const uint64_t fold_serial =
++            g_fold_serial.load(std::memory_order_acquire);
++        if (fold_serial != last_fold_serial) {
++            last_fold_serial = fold_serial;
++            const bool separating =
++                g_fold_separating.load(std::memory_order_relaxed);
++            const int orientation =
++                g_fold_orientation.load(std::memory_order_relaxed);
++            presentation.fold_valid = separating;
++            presentation.fold_horizontal = orientation == 1;
++            presentation.fold_left = static_cast<float>(
++                g_fold_left_permille.load(std::memory_order_relaxed));
++            presentation.fold_top = static_cast<float>(
++                g_fold_top_permille.load(std::memory_order_relaxed));
++            presentation.fold_right = static_cast<float>(
++                g_fold_right_permille.load(std::memory_order_relaxed));
++            presentation.fold_bottom = static_cast<float>(
++                g_fold_bottom_permille.load(std::memory_order_relaxed));
++            reconfigure_single();
++            const char* fold_kind = !separating
++                ? "none"
++                : (presentation.fold_horizontal ? "horizontal"
++                                                : "vertical");
++            std::fprintf(stderr,
++                         "[sdl] fold layout: %s separating=%d "
++                         "rect=%d,%d..%d,%d\n",
++                         fold_kind, separating ? 1 : 0,
++                         static_cast<int>(presentation.fold_left),
++                         static_cast<int>(presentation.fold_top),
++                         static_cast<int>(presentation.fold_right),
++                         static_cast<int>(presentation.fold_bottom));
++        }
+         const uint64_t current_audio_epoch = nds_spu_presentation_epoch();
+         if (current_audio_epoch != audio_presentation_epoch) {
+             // A state load abandoned the samples already buffered in SDL.
+@@ -2829,8 +3644,8 @@
+             clear_audio_queue(audio, audio_queue);
+             audio_queue.started.store(false, std::memory_order_relaxed);
+             audio_started = false;
+-            audio_start_threshold = kAudioQueueFrames;
+-            audio_pace_floor = kAudioQueueFrames;
++            audio_start_threshold = audio_queue_frames;
++            audio_pace_floor = audio_queue_frames;
+             audio_presentation_epoch = current_audio_epoch;
+         }
+         if (selftest_menu) {
+@@ -3014,9 +3829,126 @@
+                 relative_mouse_selftest_stage = 10;
+             }
+         }
++        virtual_controls.visible =
++            presentation.single &&
++            (options.virtual_controls == NdsVirtualControlsMode::On ||
++             (options.virtual_controls == NdsVirtualControlsMode::Auto &&
++              !controller));
++        if (!virtual_controls.visible) {
++            const bool had_pressed = virtual_controls_pressed != 0;
++            for (auto& button : virtual_controls.buttons) {
++                button.held = false;
++                button.anim = 0.0f;
++                button.velocity = 0.0f;
++            }
++            virtual_controls.mouse_button = -1;
++            for (int& index : virtual_controls.finger_button) index = -1;
++            virtual_controls_pressed = 0;
++            if (had_pressed) publish_keys();
++        }
+         SDL_Event event{};
+         while (SDL_PollEvent(&event)) {
+             convert_mouse_event_to_logical_coordinates(event, presentation);
++            if (virtual_controls.visible &&
++                event.type == SDL_MOUSEBUTTONDOWN &&
++                event.button.button == SDL_BUTTON_LEFT &&
++                event.button.windowID == presentation.window_ids[0]) {
++                const int index = virtual_control_at(
++                    presentation, event.button.x, event.button.y);
++                if (index >= 0) {
++                    virtual_controls.mouse_button = index;
++                    virtual_controls.buttons[index].held = true;
++                    virtual_controls_pressed =
++                        virtual_controls_mask(virtual_controls);
++                    publish_keys();
++                    continue;
++                }
++            }
++            if (virtual_controls.visible &&
++                event.type == SDL_MOUSEMOTION &&
++                virtual_controls.mouse_button >= 0) {
++                const int next = virtual_control_at(
++                    presentation, event.motion.x, event.motion.y);
++                if (next != virtual_controls.mouse_button) {
++                    virtual_controls.buttons[
++                        virtual_controls.mouse_button].held = false;
++                    virtual_controls.mouse_button = next;
++                    if (next >= 0) virtual_controls.buttons[next].held = true;
++                    virtual_controls_pressed =
++                        virtual_controls_mask(virtual_controls);
++                    publish_keys();
++                }
++                continue;
++            }
++            if (virtual_controls.visible &&
++                event.type == SDL_MOUSEBUTTONUP &&
++                event.button.button == SDL_BUTTON_LEFT &&
++                virtual_controls.mouse_button >= 0) {
++                virtual_controls.buttons[
++                    virtual_controls.mouse_button].held = false;
++                virtual_controls.mouse_button = -1;
++                virtual_controls_pressed =
++                    virtual_controls_mask(virtual_controls);
++                publish_keys();
++                continue;
++            }
++            if (virtual_controls.visible &&
++                (event.type == SDL_FINGERDOWN ||
++                 event.type == SDL_FINGERMOTION ||
++                 event.type == SDL_FINGERUP)) {
++                int slot = -1;
++                for (int i = 0; i < 8; ++i) {
++                    if (virtual_controls.finger_id[i] ==
++                        event.tfinger.fingerID) {
++                        slot = i;
++                        break;
++                    }
++                }
++                int window_width = 0;
++                int window_height = 0;
++                SDL_GetWindowSize(presentation.windows[0], &window_width,
++                                  &window_height);
++                float logical_x = event.tfinger.x * window_width;
++                float logical_y = event.tfinger.y * window_height;
++                SDL_RenderCoordinatesFromWindow(
++                    presentation.renderers[0], logical_x, logical_y,
++                    &logical_x, &logical_y);
++                const int index = virtual_control_at(
++                    presentation, logical_x, logical_y);
++                if (slot < 0 && index >= 0) {
++                    for (int i = 0; i < 8; ++i) {
++                        if (virtual_controls.finger_id[i] < 0) {
++                            slot = i;
++                            break;
++                        }
++                    }
++                    if (slot >= 0) {
++                        virtual_controls.finger_id[slot] =
++                            event.tfinger.fingerID;
++                        virtual_controls.finger_button[slot] = index;
++                    }
++                }
++                if (slot >= 0) {
++                    const int previous =
++                        virtual_controls.finger_button[slot];
++                    if (event.type == SDL_FINGERUP) {
++                        if (previous >= 0)
++                            virtual_controls.buttons[previous].held = false;
++                        virtual_controls.finger_id[slot] = -1;
++                        virtual_controls.finger_button[slot] = -1;
++                    } else if (index >= 0 &&
++                               index != virtual_controls.finger_button[slot]) {
++                        if (previous >= 0)
++                            virtual_controls.buttons[previous].held = false;
++                        virtual_controls.finger_button[slot] = index;
++                        virtual_controls.buttons[index].held = true;
++                    }
++                    virtual_controls_pressed =
++                        virtual_controls_mask(virtual_controls);
++                    publish_keys();
++                    continue;
++                }
++            }
+             if (event.type == SDL_QUIT) {
+                 release_relative_mouse();
+                 running = false;
+@@ -3046,6 +3978,13 @@
+                     presentation_window_focused[index] = true;
+                 focus_release_pending = false;
+             }
++#if defined(NDS_HAVE_SDL3)
++            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_RESIZED) ||
++                sdl_window_event_is(event, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) ||
++                sdl_window_event_is(event, SDL_EVENT_WINDOW_DISPLAY_CHANGED)) {
++                reconfigure_single();
++            }
++#endif
+             // NDS_DEBUG_KEYEV=1: trace every polled keyboard event to stderr.
+             // Exists because an injected key that vanishes between
+             // SDL_PushEvent (debug pump, counted) and this loop is otherwise
+@@ -3147,8 +4086,7 @@
+                             set_touch_from_mouse(
+                                 static_cast<float>(last_touch_event_x),
+                                 static_cast<float>(last_touch_event_y),
+-                                true, options.screen_layout,
+-                                bottom_logical_width);
++                                true, stacked_bottom_touch);
+                         } else {
+                             nds_set_touch(0, 0, false);
+                         }
+@@ -3378,8 +4316,7 @@
+                 touch_release_pending = false;
+                 touch_frames_held = 0;
+                 set_touch_from_mouse(event.button.x, event.button.y, true,
+-                                     options.screen_layout,
+-                                     bottom_logical_width);
++                                     stacked_bottom_touch);
+             }
+             if (!virtual_stylus_mouse_consumed &&
+                 event.type == SDL_MOUSEBUTTONUP &&
+@@ -3394,14 +4331,12 @@
+                     touch_release_pending = true;
+                 else
+                     set_touch_from_mouse(event.button.x, event.button.y, false,
+-                                         options.screen_layout,
+-                                         bottom_logical_width);
++                                         stacked_bottom_touch);
+             }
+             if (event.type == SDL_MOUSEMOTION && mouse_down &&
+                 event.motion.windowID == presentation.window_ids[1])
+                 set_touch_from_mouse(event.motion.x, event.motion.y, true,
+-                                     options.screen_layout,
+-                                     bottom_logical_width);
++                                     stacked_bottom_touch);
+             if (event.type == SDL_MOUSEMOTION &&
+                 virtual_stylus_active() &&
+                 (event.motion.windowID == presentation.window_ids[0] ||
+@@ -3689,7 +4624,7 @@
+                 audio_queue.started.store(false, std::memory_order_relaxed);
+             }
+             audio_started = false;
+-            audio_start_threshold = kAudioQueueFrames;
++            audio_start_threshold = audio_queue_frames;
+             audio_pace_floor = audio_start_threshold;
+             audio_min_queue = std::numeric_limits<uint32_t>::max();
+             audio_max_queue = 0;
+@@ -3748,6 +4683,12 @@
+                 else
+                     nds_set_touch(128, 96, true);
+             }
++        }
++        const uint16_t next_scripted =
++            scripted_key_mask(shown_frames + 1);
++        if (next_scripted != scripted_pressed) {
++            scripted_pressed = next_scripted;
++            publish_keys();
+         }
+         publish_input_debug();
+ 
+@@ -3850,7 +4791,8 @@
+                 runtime_ui,
+                 mph_prime_virtual_stylus || generic_virtual_stylus,
+                 mph_virtual_x, mph_virtual_y,
+-                savestate_notice.empty() ? nullptr : savestate_notice.c_str());
++                savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
++                virtual_controls, 0);
+             if (!synthetic_ticks.ok) {
+                 compute_failed = true;
+                 running = false;
+@@ -3874,7 +4816,8 @@
+             runtime_ui,
+             mph_prime_virtual_stylus || generic_virtual_stylus,
+             mph_virtual_x, mph_virtual_y,
+-            savestate_notice.empty() ? nullptr : savestate_notice.c_str());
++            savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
++            virtual_controls, shown_frames + 1);
+         if (!presentation_ticks.ok) {
+             compute_failed = true;
+             running = false;
+@@ -3907,17 +4850,17 @@
+         // 63 ms target, shedding the extra startup latency over a couple of
+         // seconds without ever forcing the queue down during a slow stretch.
+         constexpr uint32_t kGlideStepFrames = 300;
+-        if (audio_pace_floor > kAudioQueueFrames + kGlideStepFrames)
++        if (audio_pace_floor > audio_queue_frames + kGlideStepFrames)
+             audio_pace_floor -= kGlideStepFrames;
+         else
+-            audio_pace_floor = kAudioQueueFrames;
++            audio_pace_floor = audio_queue_frames;
+         uint32_t queued = audio_queue_count(audio, audio_queue);
+         if (turbo_active) {
+             discard_spu_output();
+         } else {
+             queued = drain_audio(
+                 audio, audio_queue, audio_started, audio_pace_floor,
+-                audio_queue_error);
++                audio_queue_error, audio_fade_frames, audio_fade_remaining);
+         }
+         const uint64_t frame_drain_ticks =
+             SDL_GetPerformanceCounter() - phase2;
+@@ -3930,6 +4873,7 @@
+             audio_queue.started.store(true, std::memory_order_relaxed);
+             pause_audio(audio, false);
+             audio_started = true;
++            audio_fade_remaining = audio_fade_frames;
+             audio_min_queue = queued;
+             audio_pace_floor = audio_start_threshold;
+         }
+--- a/runner/src/frontend.h
++++ b/runner/src/frontend.h
+@@ -12,12 +12,22 @@
+ enum class NdsScreenLayout : uint8_t {
+     Stacked,
+     Separate,
++    // One window: the top screen stays at native size in a 16:9 canvas and
++    // the touch screen is a picture-in-picture inset at the lower right.
++    Single,
+ };
+ 
+ enum class NdsFullscreenMode : uint8_t {
+     Off,
+     Borderless,
+     Exclusive,
++};
++
++enum class NdsVirtualControlsMode : uint8_t {
++    Off,
++    // Show on touch devices only when no gamepad is connected.
++    Auto,
++    On,
+ };
+ 
+ // How the authentic firmware handles an inserted Slot-1 cartridge. Preserve
+@@ -193,6 +203,11 @@
+     // title-owned setting in this config is rejected for any other ROM.
+     std::string expected_rom_sha1;
+     NdsScreenLayout screen_layout = NdsScreenLayout::Stacked;
++#if defined(__ANDROID__)
++    NdsVirtualControlsMode virtual_controls = NdsVirtualControlsMode::Auto;
++#else
++    NdsVirtualControlsMode virtual_controls = NdsVirtualControlsMode::Off;
++#endif
+     NdsFullscreenMode fullscreen = NdsFullscreenMode::Off;
+     NdsStartupMode startup_mode = NdsStartupMode::Preserve;
+     NdsBootMode boot_mode = NdsBootMode::Lle;
+@@ -323,6 +338,8 @@
+                               std::string* error);
+ bool nds_parse_screen_layout(const std::string& value,
+                              NdsScreenLayout* out);
++bool nds_parse_virtual_controls(const std::string& value,
++                                NdsVirtualControlsMode* out);
+ bool nds_parse_fullscreen_mode(const std::string& value,
+                                NdsFullscreenMode* out);
+ enum class NdsFullscreenOverrideError : uint8_t {
+@@ -371,6 +388,7 @@
+ bool nds_parse_local_wireless_base_port(const std::string& value,
+                                         uint16_t* out);
+ const char* nds_screen_layout_name(NdsScreenLayout value);
++const char* nds_virtual_controls_name(NdsVirtualControlsMode value);
+ const char* nds_fullscreen_mode_name(NdsFullscreenMode value);
+ const char* nds_startup_mode_name(NdsStartupMode value);
+ const char* nds_boot_mode_name(NdsBootMode value);
+@@ -383,6 +401,15 @@
+ // scenario harnesses use this instead of TerminateProcess so runtime teardown
+ // (including compiler profile-data flushing) completes normally.
+ bool nds_frontend_request_exit();
++
++// Android foldable posture input. Coordinates are window pixels and
++// orientation is 1 for a horizontal hinge (tabletop) or 2 for a vertical one
++// (book); separating=false clears the split and restores the normal single
++// layout. Safe to call from the Android UI thread; the frontend applies the
++// newest state on its next frame.
++void nds_frontend_set_fold_state(int left, int top, int right, int bottom,
++                                 int orientation, bool separating,
++                                 int window_width, int window_height);
+ 
+ // Live frontend counters for the play-mode debug surface (`frontend_stats`).
+ // Cumulative since frontend start; a client samples twice and derives fps /
+--- a/runner/src/frontend_config.cpp
++++ b/runner/src/frontend_config.cpp
+@@ -30,14 +30,37 @@
+                              NdsScreenLayout* out) {
+     if (!out) return false;
+     const std::string normalized = lower_ascii(value);
+-    if (normalized == "stacked" || normalized == "combined" ||
+-        normalized == "single") {
++    if (normalized == "stacked" || normalized == "combined") {
+         *out = NdsScreenLayout::Stacked;
++        return true;
++    }
++    if (normalized == "single" || normalized == "merged" ||
++        normalized == "pip") {
++        *out = NdsScreenLayout::Single;
+         return true;
+     }
+     if (normalized == "separate" || normalized == "two-window" ||
+         normalized == "two_windows") {
+         *out = NdsScreenLayout::Separate;
++        return true;
++    }
++    return false;
++}
++
++bool nds_parse_virtual_controls(const std::string& value,
++                                NdsVirtualControlsMode* out) {
++    if (!out) return false;
++    const std::string normalized = lower_ascii(value);
++    if (normalized == "off" || normalized == "none" || normalized == "false") {
++        *out = NdsVirtualControlsMode::Off;
++        return true;
++    }
++    if (normalized == "auto" || normalized == "automatic") {
++        *out = NdsVirtualControlsMode::Auto;
++        return true;
++    }
++    if (normalized == "on" || normalized == "true" || normalized == "touch") {
++        *out = NdsVirtualControlsMode::On;
+         return true;
+     }
+     return false;
+@@ -420,7 +443,19 @@
+ }
+ 
+ const char* nds_screen_layout_name(NdsScreenLayout value) {
+-    return value == NdsScreenLayout::Separate ? "separate" : "stacked";
++    switch (value) {
++        case NdsScreenLayout::Separate: return "separate";
++        case NdsScreenLayout::Single: return "single";
++        default: return "stacked";
++    }
++}
++
++const char* nds_virtual_controls_name(NdsVirtualControlsMode value) {
++    switch (value) {
++        case NdsVirtualControlsMode::On: return "on";
++        case NdsVirtualControlsMode::Auto: return "auto";
++        default: return "off";
++    }
+ }
+ 
+ const char* nds_frame_interpolation_name(NdsFrameInterpolation value) {
+@@ -552,7 +587,18 @@
+                                          &options->screen_layout)) {
+                 if (error) {
+                     *error =
+-                        "display.screen_layout must be stacked or separate";
++                        "display.screen_layout must be stacked, single, or separate";
++                }
++                return false;
++            }
++        }
++        if (const auto value =
++                (*display)["virtual_controls"].value<std::string>()) {
++            if (!nds_parse_virtual_controls(*value,
++                                            &options->virtual_controls)) {
++                if (error) {
++                    *error =
++                        "display.virtual_controls must be off, auto, or on";
+                 }
+                 return false;
+             }
+--- a/runner/src/main.cpp
++++ b/runner/src/main.cpp
+@@ -390,6 +390,7 @@
+     std::string rom_path;
+     std::string config_path = "game.toml";
+     std::string cli_screen_layout;
++    std::string cli_virtual_controls;
+     std::string cli_fullscreen;
+     std::string cli_adaptive_screens;
+     std::string cli_widescreen_width;
+@@ -525,6 +526,8 @@
+             config_explicit = true;
+         } else if (a == "--screen-layout" && i + 1 < argc) {
+             cli_screen_layout = argv[++i];
++        } else if (a == "--virtual-controls" && i + 1 < argc) {
++            cli_virtual_controls = argv[++i];
+         } else if (a == "--fullscreen" && i + 1 < argc) {
+             cli_fullscreen = argv[++i];
+         } else if (a == "--adaptive-widescreen" && i + 1 < argc) {
+@@ -679,7 +682,8 @@
+                 "[--firmware-path firmware.bin] "
+                 "[--firmware-state-path mutable-firmware.bin] "
+                 "[--config game.toml] "
+-                "[--screen-layout stacked|separate] "
++                "[--screen-layout stacked|single|separate] "
++                "[--virtual-controls off|auto|on] "
+                 "[--fullscreen off|borderless|exclusive] "
+                 "[--adaptive-widescreen none|top|bottom|both] "
+                 "[--widescreen-width even:256..448] "
+@@ -781,7 +785,16 @@
+                                      &frontend_options.screen_layout)) {
+             std::fprintf(stderr,
+                          "invalid NDS_SCREEN_LAYOUT "
+-                         "(expected stacked or separate)\n");
++                         "(expected stacked, single, or separate)\n");
++            return 2;
++        }
++    }
++    if (const char* value = std::getenv("NDS_VIRTUAL_CONTROLS")) {
++        if (!nds_parse_virtual_controls(value,
++                                        &frontend_options.virtual_controls)) {
++            std::fprintf(stderr,
++                         "invalid NDS_VIRTUAL_CONTROLS "
++                         "(expected off, auto, or on)\n");
+             return 2;
+         }
+     }
+@@ -921,7 +934,15 @@
+                                  &frontend_options.screen_layout)) {
+         std::fprintf(stderr,
+                      "invalid --screen-layout "
+-                     "(expected stacked or separate)\n");
++                     "(expected stacked, single, or separate)\n");
++        return 2;
++    }
++    if (!cli_virtual_controls.empty() &&
++        !nds_parse_virtual_controls(cli_virtual_controls,
++                                    &frontend_options.virtual_controls)) {
++        std::fprintf(stderr,
++                     "invalid --virtual-controls "
++                     "(expected off, auto, or on)\n");
+         return 2;
+     }
+     if (!cli_adaptive_screens.empty() &&

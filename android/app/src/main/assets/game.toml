@@ -1,0 +1,56 @@
+# Digimon Story: Lost Evolution (Japan rev 0, Operation Decoded T-En v1.1
+# + AP fix) — title-owned runner configuration.
+# ROM identity is checked by SHA-1 below; the runner rejects a
+# different cartridge before applying any of these settings.
+
+[game]
+name = "Digimon Story: Lost Evolution"
+id = "BLEJ"
+region = "JPN (T-En v1.1, AP fix)"
+revision = 0
+status = "direct boot verified through the opening field dialogue; English, Japanese and simplified-Chinese profiles boot; later chapters not verified"
+rom = "roms/Digimon Story - Lost Evolution (Japan) [T-En by Operation Decoded v1.1] [AP fix].nds"
+rom_size = 0x039CAA74
+sha1 = "83b4104e654ed2423c0a609802ec6b2843874fd3"
+
+[display]
+# Audited single-screen layout: top screen at native size on the left, touch
+# screen as a 160x120 side panel on the right.
+# Set "stacked" for the original two-screen vertical view, or "separate" for
+# two windows.
+screen_layout = "single"
+supersampling = 1
+antialiasing = 0
+
+[system]
+# Exercise the authentic BIOS/firmware/card path; auto-launch the inserted
+# cartridge after the normal firmware sequence.
+startup_mode = "automatic"
+
+[cartridge]
+# EEPROM 512 kbit = 64 KiB — confirmed from the loaded melonDS cartridge:
+# BLEJ SaveMemType=3, GetNDSSaveLength()=65536, regular EEPROM SRAMType=2.
+# The device and save-file plumbing are covered by cart_backup_test and
+# battery_save_test; an in-game save/reload playthrough is still pending.
+save_type = "eeprom"
+save_size = 65536
+
+[arm9]
+rom_offset = 0x00004000
+entry_pc = 0x02000800
+load_address = 0x02000000
+size = 0x0015C6B8
+
+[arm7]
+rom_offset = 0x000D9C00
+entry_pc = 0x02380000
+load_address = 0x02380000
+size = 0x00026370
+
+[framework]
+# Informational. tools/lostevo.py fetches the pinned sources into
+# ./ndsrecomp and ./recomp-ui (or honours NDSRECOMP_ROOT / RECOMP_UI_ROOT).
+# tools/lostevo.py also honors NDSRECOMP_ROOT / RECOMP_UI_ROOT.
+path = "ndsrecomp"
+ndsrecomp_pin = "74efebb5"
+recomp_ui_pin = "41c88ffea852b970af8d50312620b17404e455ad"

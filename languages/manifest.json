@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "default": "en",
+  "languages": [
+    {
+      "id": "en",
+      "name": "English",
+      "native_name": "English",
+      "edition": "Operation Decoded v1.1 (AP fix)",
+      "rom": "roms/Digimon Story - Lost Evolution (Japan) [T-En by Operation Decoded v1.1] [AP fix].nds",
+      "sha1": "83b4104e654ed2423c0a609802ec6b2843874fd3",
+      "rom_size": 60598900,
+      "config": "game.toml",
+      "bank_dir": "generated/recomp",
+      "save": "saves/lostevo-en.sav",
+      "status": "verified",
+      "verify_vblanks": 300,
+      "verified": {
+        "date": "2026-11-07",
+        "platform": "windows-x86_64",
+        "check": "direct boot reaches the licensed-by screen, animated intro and title; 300-vblank attract smoke passed"
+      }
+    },
+    {
+      "id": "zh-Hans",
+      "name": "Simplified Chinese",
+      "native_name": "简体中文",
+      "edition": "Xzonn DSLEChsLocalization v1.0.1",
+      "rom": "roms/Digimon Story - Lost Evolution (Japan) [Zh-Hans v1.0.1].nds",
+      "sha1": "e4798bff1c9a9753c1a32f2e3a50a3c921438f3e",
+      "rom_size": 61141288,
+      "config": "game-zh.toml",
+      "bank_dir": "generated/recomp-zh",
+      "save": "saves/lostevo-zh-Hans.sav",
+      "status": "verified",
+      "verify_vblanks": 3000,
+      "verified": {
+        "date": "2026-11-07",
+        "platform": "windows-x86_64",
+        "check": "direct boot reaches the Chinese title logo and 按START键 prompt; 3000-vblank attract smoke passed"
+      },
+      "patch": {
+        "kind": "xzp",
+        "release_url": "https://github.com/Xzonn/DSLEChsLocalization/releases/download/v1.0.1/DSLEChsLocalization.v1.0.1.zip",
+        "release_sha256": "82bed3b65da7bfed459ea46af20ad420466ee08133b9cc6b611d1408f1b9e63d",
+        "patch_sha256": "610441fc479868086799ddea5a480e71f610166aafc5111b35101eb2eb08f855",
+        "base_rom": "roms/Digimon Story - Lost Evolution (Japan).nds",
+        "base_sha1": "f180146f517712c177d6497125a24f35b0d6102f",
+        "canonical_output_sha1": "45d12644e1a5b6dbf1d84d2898ed53d7fd455d1b",
+        "note": "The canonical hash is from NitroPatcher. This project's ndspy repack preserves the same files and produces a functionally equivalent image with a different layout hash; the manifest is refreshed to the actual hash."
+      }
+    },
+    {
+      "id": "ja",
+      "name": "Japanese",
+      "native_name": "日本語",
+      "edition": "Retail Japan rev 0",
+      "rom": "roms/Digimon Story - Lost Evolution (Japan).nds",
+      "sha1": "f180146f517712c177d6497125a24f35b0d6102f",
+      "rom_size": 67108864,
+      "config": "game-ja.toml",
+      "bank_dir": "generated/recomp-ja",
+      "save": "saves/lostevo-ja.sav",
+      "status": "verified",
+      "verify_vblanks": 3000,
+      "verified": {
+        "date": "2026-11-07",
+        "platform": "windows-x86_64",
+        "check": "direct boot reaches the Japanese title logo; 3000-vblank attract smoke passed"
+      }
+    }
+  ]
+}

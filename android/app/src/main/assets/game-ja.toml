@@ -1,0 +1,37 @@
+# Digimon Story: Lost Evolution — retail Japanese profile.
+# This is the unmodified Japanese cartridge. It is useful as a reference and
+# as the base image for the Chinese fan patch.
+
+[game]
+name = "Digimon Story: Lost Evolution (日本語)"
+id = "BLEJ"
+region = "JPN"
+revision = 0
+status = "verified: Japanese title logo, attract sequence and name entry boot through the recomp runner"
+rom = "roms/Digimon Story - Lost Evolution (Japan).nds"
+rom_size = 0x04000000
+sha1 = "f180146f517712c177d6497125a24f35b0d6102f"
+
+[display]
+screen_layout = "single"
+supersampling = 1
+antialiasing = 0
+
+[system]
+startup_mode = "automatic"
+
+[cartridge]
+save_type = "eeprom"
+save_size = 65536
+
+[arm9]
+rom_offset = 0x00004000
+entry_pc = 0x02000800
+load_address = 0x02000000
+size = 0x0015C6B8
+
+[arm7]
+rom_offset = 0x000D9C00
+entry_pc = 0x02380000
+load_address = 0x02380000
+size = 0x00026370

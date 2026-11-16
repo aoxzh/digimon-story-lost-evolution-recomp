@@ -1,0 +1,5 @@
+# Python dependencies for the title tooling.
+# The runner itself is C++; these are only for ROM preparation, patching,
+# verification screenshots and the launcher.
+ndspy>=4.2
+pillow>=10.0

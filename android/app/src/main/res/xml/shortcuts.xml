@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="file_setup"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/setup_shortcut_short"
+        android:shortcutLongLabel="@string/setup_shortcut_long">
+        <intent
+            android:action="io.github.lostevo.recomp.SETUP"
+            android:targetPackage="io.github.lostevo.recomp"
+            android:targetClass="io.github.lostevo.recomp.SetupActivity" />
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+</shortcuts>

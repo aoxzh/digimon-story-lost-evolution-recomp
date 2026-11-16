@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Lost Evolution</string>
+    <string name="setup_shortcut_short">文件设置</string>
+    <string name="setup_shortcut_long">重新选择 ROM / BIOS / 语言</string>
+</resources>

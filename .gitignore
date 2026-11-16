@@ -1,0 +1,41 @@
+# Game and console data: never commit
+*.nds
+*.sav
+*.dsv
+*.state
+*.rom
+bios*.bin
+firmware*.bin
+*.xzp
+roms/
+saves/
+run/
+downloads/
+.state/
+
+# Game-derived build output (contains translated game code)
+generated/
+dist/
+*.apk
+android/app/src/main/jniLibs/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/.gradle/
+android/local.properties
+
+# Framework and UI sources fetched by tools/lostevo.py bootstrap
+ndsrecomp/
+recomp-ui/
+
+# Python environments and caches
+.venv*/
+__pycache__/
+*.pyc
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
