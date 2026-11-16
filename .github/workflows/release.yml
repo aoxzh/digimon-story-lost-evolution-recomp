@@ -1,7 +1,8 @@
 name: release
 
-# Publishes the source/tooling archive. It contains no game data: the game is
-# built on the player's machine from their own ROM.
+# Builds the player download. It contains no game data, so it can be built on
+# a public runner: the game itself is built later, on the player's PC, from
+# the player's own ROM.
 on:
   push:
     tags: ["v*"]
@@ -11,8 +12,8 @@ permissions:
   contents: write
 
 jobs:
-  package:
-    runs-on: ubuntu-latest
+  windows-kit:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,14 +21,25 @@ jobs:
           python-version: "3.12"
       - name: Tests
         run: python -m unittest discover -s tests -v
-      - name: Package sources
-        run: python tools/package_release.py --out "dist/lostevo-recomp-$(cat VERSION)-sources.zip"
+      - name: Fetch and patch the pinned framework sources
+        run: python tools/lostevo.py bootstrap
+      - name: Package
+        shell: bash
+        run: |
+          version="$(cat VERSION)"
+          python tools/package_release.py --windows-kit \
+            --out "dist/DigimonLostEvolutionRecomp-${version}-windows-x64.zip"
+          python tools/package_release.py \
+            --out "dist/DigimonLostEvolutionRecomp-${version}-sources.zip"
+          ls -l dist
       - uses: actions/upload-artifact@v4
         with:
-          name: sources
+          name: release
           path: dist/*
+          if-no-files-found: error
       - name: Publish draft release
         if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -4,3 +4,4 @@
 *.png binary
 *.jar binary
 *.patch -text
+*.ps1 text eol=crlf

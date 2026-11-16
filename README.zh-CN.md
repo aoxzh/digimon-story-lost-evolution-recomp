@@ -24,11 +24,21 @@
 
 **不需要 BIOS 或固件 dump。** 默认使用内置的开源 [FreeBIOS](https://github.com/mstan/freebios) 启动。如果想用自己的 dump，把 `biosnds9.rom`、`biosnds7.rom` 放到 `run/bios/`，校验 SHA-1 后会自动使用。
 
-## 构建与运行
+## Windows 一键游玩
 
-需要 Python 3.10+、CMake 3.20+、Ninja、C++20 编译器（推荐 clang）、SDL3 和 git。
+1. 从 [Releases](../../releases) 下载 `DigimonLostEvolutionRecomp-<版本>-windows-x64.zip`，把**整个**文件夹解压到可写入的位置（例如 `文档\Games`，不要放在 `Program Files`）。
+2. 把你的 ROM 放进 `roms` 文件夹（文件名随意），或直接拖到 `play.bat` 上。工具按 SHA-1 自动识别版本。
+3. 双击 **`play.bat`**。
 
-### Windows
+首次启动会把私有构建工具包下载到 `kit\`（llvm-mingw/clang、CMake、Ninja、SDL3、xdelta3、ndspy，约 250 MiB，逐个校验 SHA-256），然后用你的 ROM 构建游戏；有日版镜像时会顺带生成中文版。大约需要 5–15 分钟，完整日志在 `run\build.log`。之后启动直接进入语言菜单。不会向系统安装任何东西，也不需要管理员权限；没有 Python 3.10+ 时会自动下载一份私有 Python。
+
+`play.bat --rebuild` 重新完整构建；`play.bat --language zh-Hans` 跳过菜单。若 Windows SmartScreen 提示，选择“更多信息 → 仍要运行”。
+
+## 从源码构建
+
+需要 Python 3.10+、CMake 3.20+、Ninja、C++20 编译器（推荐 clang）、SDL3 和 git。在 Windows 的 git 仓库中直接运行 `play.bat` 也会用私有工具包完成以下全部步骤。
+
+### Windows（MSYS2）
 
 在 [MSYS2](https://www.msys2.org/) 终端中安装工具链：
 
@@ -86,7 +96,7 @@ python3 tools/lostevo.py play
 - 通过 DS 固件菜单启动会停住；启动器使用已验证的直接启动
 - 6 个 ARM9 overlay 与两段重定位的 ARM7 代码仍由内置解释器执行
 - 宽屏：目前检查过的场景都是 2D，自适应宽屏默认关闭
-- 暂无预编译下载，需要从源码构建
+- Linux / macOS 暂无下载包，需要从源码构建
 - 不支持 Wi-Fi 与麦克风
 
 ## Android（实验性）

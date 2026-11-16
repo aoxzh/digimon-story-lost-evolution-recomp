@@ -4,7 +4,8 @@
 
 English | [简体中文](README.zh-CN.md)
 
-[![Platform: Windows / Linux / macOS](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0078D6)](#build-and-play)
+[![Windows: one-click download](https://img.shields.io/badge/Windows-one--click%20download-0078D6)](#play-on-windows)
+[![Linux / macOS: build from source](https://img.shields.io/badge/Linux%20%7C%20macOS-build%20from%20source-555555)](#build-from-source)
 [![Android: experimental](https://img.shields.io/badge/Android-experimental-3DDC84)](android/README.md)
 [![Status: early access](https://img.shields.io/badge/status-early%20access-orange)](#status)
 [![License: MIT (tooling)](https://img.shields.io/badge/license-MIT%20%2B%20third%20party-lightgrey)](#license)
@@ -25,15 +26,27 @@ English | [简体中文](README.zh-CN.md)
 | `en` | Operation Decoded T-En v1.1 (AP fix), trimmed | 60,598,900 | `83b4104e654ed2423c0a609802ec6b2843874fd3` |
 | `zh-Hans` | Xzonn DSLEChsLocalization v1.0.1 | built from the `ja` dump | see [docs/LANGUAGES.md](docs/LANGUAGES.md) |
 
-Put your dumps in `roms/` with the names listed in [`languages/manifest.json`](languages/manifest.json), or point `LOSTEVO_ROM_DIR` at the folder that holds them. You only need the editions you want to play. The Chinese image is made for you from the Japanese dump (`python tools/lostevo.py patch zh-Hans`).
+You only need the editions you want to play. The Chinese image is made for you from the Japanese dump.
 
 **No BIOS or firmware dump is needed.** The runner boots on the bundled open-source [FreeBIOS](https://github.com/mstan/freebios). If you prefer your own dumps, put `biosnds9.rom` and `biosnds7.rom` in `run/bios/`; they are SHA-1 checked and used automatically.
 
-## Build and play
+## Play on Windows
 
-You need Python 3.10+, CMake 3.20+, Ninja, a C++20 compiler (clang recommended), SDL3 and git.
+1. Download `DigimonLostEvolutionRecomp-<version>-windows-x64.zip` from [Releases](../../releases) and unzip the **whole** folder somewhere you can write to, such as `Documents\Games` (not `Program Files`).
+2. Put your ROM dump(s) in the `roms` folder (any file name), or drag them onto `play.bat`. Each file is identified by its SHA-1.
+3. Double-click **`play.bat`**.
 
-### Windows
+The first start downloads a private build kit into `kit\` — llvm-mingw (clang), CMake, Ninja, SDL3, xdelta3 and ndspy, about 250 MiB, each SHA-256 verified — then builds the game from your ROM. With the Japanese dump it also makes the Chinese edition. This takes roughly 5–15 minutes and shows progress; the full log is `run\build.log`. Later starts go straight to the language menu. Nothing is installed system-wide and no administrator rights are needed. If Python 3.10+ is missing, `play.bat` fetches a private copy too.
+
+`play.bat --rebuild` rebuilds from scratch; `play.bat --language en` skips the menu. Windows SmartScreen may warn about a downloaded script: *More info → Run anyway*.
+
+## Build from source
+
+You need Python 3.10+, CMake 3.20+, Ninja, a C++20 compiler (clang recommended), SDL3 and git. On Windows, running `play.bat` in a git checkout does all of this for you with the private kit.
+
+Put your dumps in `roms/` with the names listed in [`languages/manifest.json`](languages/manifest.json), or point `LOSTEVO_ROM_DIR` at the folder that holds them. `python tools/lostevo.py patch zh-Hans` makes the Chinese image.
+
+### Windows (MSYS2)
 
 Install the toolchain from an [MSYS2](https://www.msys2.org/) shell:
 
@@ -101,7 +114,7 @@ Not yet verified or not implemented:
 - **Booting through the DS firmware menu** halts; the launcher uses direct boot, which is the verified path.
 - The game's six ARM9 **overlays** and two relocated ARM7 blocks still run on the framework's built-in interpreter.
 - **Widescreen:** the scenes checked so far are 2D, so the framework's adaptive widescreen is off.
-- No prebuilt download yet: you build from source (see above).
+- No Linux or macOS download: build from source there (see above).
 - Wi-Fi and the microphone are not supported.
 
 ## Android (experimental)

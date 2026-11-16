@@ -239,7 +239,11 @@ def find_ninja(cmake: Path) -> Path:
 def build_env(cmake: Path) -> dict[str, str]:
     env = dict(os.environ)
     parts = [str(cmake.parent)]
-    if os.name == "nt" and Path(r"C:\msys64\clang64\bin").is_dir():
+    # A pinned toolchain (CMAKE set, e.g. by tools/setup_kit.py) must not be
+    # mixed with a system MSYS2 install.
+    if os.name == "nt" and not os.environ.get("CMAKE") and Path(
+        r"C:\msys64\clang64\bin"
+    ).is_dir():
         parts.append(r"C:\msys64\clang64\bin")
     env["PATH"] = os.pathsep.join(parts + [env.get("PATH", "")])
     env.setdefault("RECOMP_UI_ROOT", str(UI_ROOT))
@@ -247,6 +251,16 @@ def build_env(cmake: Path) -> dict[str, str]:
 
 
 def compiler_args(cmake: Path) -> list[str]:
+    # An explicit CC/CXX (set by tools/setup_kit.py for the private
+    # llvm-mingw kit) wins over the clang that sits next to cmake.
+    if os.environ.get("CC") and os.environ.get("CXX"):
+        args = [
+            f"-DCMAKE_C_COMPILER={Path(os.environ['CC']).as_posix()}",
+            f"-DCMAKE_CXX_COMPILER={Path(os.environ['CXX']).as_posix()}",
+        ]
+        if os.environ.get("NINJA"):
+            args.append(f"-DCMAKE_MAKE_PROGRAM={Path(os.environ['NINJA']).as_posix()}")
+        return args
     bin_dir = cmake.parent
     names = (
         ("clang.exe", "clang++.exe")
@@ -403,8 +417,35 @@ def ensure_framework_patches() -> None:
         _apply_patch_once(ROOT / "patches" / name, label)
 
 
+PATCH_MARKER = ".lostevo-patches.json"
+
+
+def _patch_marker() -> dict:
+    marker = FRAMEWORK / PATCH_MARKER
+    if marker.is_file():
+        try:
+            return json.loads(marker.read_text(encoding="utf-8"))
+        except ValueError:
+            return {}
+    return {}
+
+
+def _record_patch(patch: Path) -> None:
+    data = _patch_marker()
+    data[patch.name] = sha256_file(patch)
+    (FRAMEWORK / PATCH_MARKER).write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
 def _apply_patch_once(patch: Path, label: str) -> None:
-    """Apply a framework patch unless it is already applied (idempotent)."""
+    """Apply a framework patch unless it is already applied (idempotent).
+
+    The release zip ships the framework already patched, with a marker that
+    records each patch's hash, so players do not need git.
+    """
+    if _patch_marker().get(patch.name) == sha256_file(patch):
+        return
     git = find_git()
     if not git:
         raise SystemExit(
@@ -417,6 +458,7 @@ def _apply_patch_once(patch: Path, label: str) -> None:
         **quiet,
     ).returncode == 0
     if applied:
+        _record_patch(patch)
         return
     check = subprocess.run(
         [str(git), "-C", str(FRAMEWORK), "apply", "--check", str(patch)],
@@ -429,6 +471,7 @@ def _apply_patch_once(patch: Path, label: str) -> None:
             "re-fetch the pinned framework with `python tools/lostevo.py bootstrap --force`"
         )
     run([git, "-C", FRAMEWORK, "apply", patch])
+    _record_patch(patch)
     print(f"framework: applied {label}")
 
 
