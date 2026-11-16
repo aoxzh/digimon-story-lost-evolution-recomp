@@ -23,6 +23,13 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Fetch and patch the pinned framework sources
         run: python tools/lostevo.py bootstrap
+      - name: Check the framework patches really applied
+        shell: bash
+        run: |
+          grep -q 'g_card_rom.assign(capacity, 0)' ndsrecomp/runner/src/io.cpp
+          test -f ndsrecomp/runner/tests/cart_rom_test.cpp
+          grep -q -- '--freebios' ndsrecomp/runner/src/android_main.cpp
+          grep -q 'NDS_FRONTEND_SHOT_DIR' ndsrecomp/runner/src/frontend.cpp
       - name: Package
         shell: bash
         run: |

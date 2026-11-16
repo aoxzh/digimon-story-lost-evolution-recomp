@@ -452,25 +452,37 @@ def _apply_patch_once(patch: Path, label: str) -> None:
             f"git is needed to apply {patch.name}; install git or apply it "
             f"manually to {FRAMEWORK}"
         )
-    quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-    applied = subprocess.run(
-        [str(git), "-C", str(FRAMEWORK), "apply", "--reverse", "--check", str(patch)],
-        **quiet,
-    ).returncode == 0
-    if applied:
+    # The framework usually sits inside this repository's own git checkout.
+    # Inside a repository, `git apply` resolves paths from the repository
+    # root and silently skips files outside the current directory, so a patch
+    # would "succeed" without changing anything. Stop git from discovering
+    # the outer repository so the framework is patched as a plain tree.
+    env = dict(os.environ)
+    env["GIT_CEILING_DIRECTORIES"] = str(FRAMEWORK.parent)
+    env.pop("GIT_DIR", None)
+    env.pop("GIT_WORK_TREE", None)
+
+    def git_apply(*args: str, capture: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(git), "apply", *args, str(patch)], cwd=str(FRAMEWORK), env=env,
+            capture_output=capture, text=True,
+        )
+
+    if git_apply("--reverse", "--check").returncode == 0:
         _record_patch(patch)
         return
-    check = subprocess.run(
-        [str(git), "-C", str(FRAMEWORK), "apply", "--check", str(patch)],
-        capture_output=True, text=True,
-    )
+    check = git_apply("--check")
     if check.returncode != 0:
         raise SystemExit(
             f"{patch.name} neither applies nor is already applied to {FRAMEWORK}:\n"
             f"{check.stderr.strip()}\n"
             "re-fetch the pinned framework with `python tools/lostevo.py bootstrap --force`"
         )
-    run([git, "-C", FRAMEWORK, "apply", patch])
+    result = git_apply()
+    if result.returncode != 0:
+        raise SystemExit(f"applying {patch.name} failed:\n{result.stderr.strip()}")
+    if git_apply("--reverse", "--check").returncode != 0:
+        raise SystemExit(f"{patch.name} reported success but is not applied to {FRAMEWORK}")
     _record_patch(patch)
     print(f"framework: applied {label}")
 
