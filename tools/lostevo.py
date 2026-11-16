@@ -464,7 +464,8 @@ def _apply_patch_once(patch: Path, label: str) -> None:
 
     def git_apply(*args: str, capture: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [str(git), "apply", *args, str(patch)], cwd=str(FRAMEWORK), env=env,
+            [str(git), "-c", "core.autocrlf=false", "apply", *args, str(patch)],
+            cwd=str(FRAMEWORK), env=env,
             capture_output=capture, text=True,
         )
 
